@@ -32,3 +32,8 @@ The package is published at
 [`github.com/tkmchain/tkmnet`](https://github.com/tkmchain/tkmnet). TKMChain
 currently compiles the matching copy in its main module so the transport and
 consensus code are released together.
+
+TKMNet becomes a required node service at the Antartical hardfork. Before the
+fork, operators may leave it disabled or enable it explicitly. Once the
+canonical head reaches Antartical, `gtkm` enables the relay automatically and
+fails startup if the loopback relay cannot be constructed.
