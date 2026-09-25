@@ -11,7 +11,18 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/ethereum/go-ethereum/node"
 )
+
+var (
+	// ErrServiceStarted is returned when Start is called more than once.
+	ErrServiceStarted = errors.New("tkmnet: service already started")
+	// ErrServiceStopped is returned when a stopped service is started again.
+	ErrServiceStopped = errors.New("tkmnet: service cannot be restarted")
+)
+
+var _ node.Lifecycle = (*Service)(nil)
 
 // ServiceConfig configures the local tkmnet relay endpoint. The endpoint is
 // intentionally a local listener: Tor publishes it as an onion service and
@@ -37,11 +48,16 @@ type Handler func(context.Context, Route, []byte) ([]byte, error)
 // can therefore be registered directly with gtkm's protocol stack.
 type Service struct {
 	cfg      ServiceConfig
+	mu       sync.RWMutex
 	listener net.Listener
 	key      *mlkem.DecapsulationKey1024
 	replay   *ReplayCache
-	stopOnce sync.Once
 	stop     chan struct{}
+	cancel   context.CancelFunc
+	ctx      context.Context
+	started  bool
+	stopped  bool
+	conns    map[net.Conn]struct{}
 	wg       sync.WaitGroup
 }
 
@@ -72,24 +88,32 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Service{cfg: cfg, key: key, replay: cfg.ReplayCache, stop: make(chan struct{})}, nil
+	return &Service{cfg: cfg, key: key, replay: cfg.ReplayCache, conns: make(map[net.Conn]struct{})}, nil
 }
 
 func (s *Service) Start() error {
 	if s == nil || !s.cfg.Enabled {
 		return nil
 	}
-	if s.listener != nil {
-		return errors.New("tkmnet: service already started")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stopped {
+		return ErrServiceStopped
+	}
+	if s.started {
+		return ErrServiceStarted
 	}
 	listener, err := net.Listen("tcp", s.cfg.ListenAddr)
 	if err != nil {
 		return fmt.Errorf("tkmnet: listen on %s: %w", s.cfg.ListenAddr, err)
 	}
+	s.ctx, s.cancel = context.WithCancel(context.Background())
+	s.stop = make(chan struct{})
 	s.listener = listener
+	s.started = true
 	s.log("tkmnet relay started", "listen", listener.Addr().String(), "hop", s.cfg.HopIndex, "relayID", s.RelayID())
 	s.wg.Add(1)
-	go s.acceptLoop()
+	go s.acceptLoop(listener)
 	return nil
 }
 
@@ -97,18 +121,40 @@ func (s *Service) Stop() error {
 	if s == nil || !s.cfg.Enabled {
 		return nil
 	}
-	s.stopOnce.Do(func() {
-		close(s.stop)
-		if s.listener != nil {
-			_ = s.listener.Close()
-		}
-	})
+	s.mu.Lock()
+	if !s.started {
+		s.mu.Unlock()
+		return nil
+	}
+	if s.stopped {
+		s.mu.Unlock()
+		s.wg.Wait()
+		return nil
+	}
+	s.stopped = true
+	close(s.stop)
+	if s.cancel != nil {
+		s.cancel()
+	}
+	listener := s.listener
+	for conn := range s.conns {
+		_ = conn.Close()
+	}
+	s.mu.Unlock()
+	if listener != nil {
+		_ = listener.Close()
+	}
 	s.wg.Wait()
 	return nil
 }
 
 func (s *Service) Addr() net.Addr {
-	if s == nil || s.listener == nil {
+	if s == nil {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if !s.started || s.stopped || s.listener == nil {
 		return nil
 	}
 	return s.listener.Addr()
@@ -132,10 +178,10 @@ func (s *Service) RelayID() [LayerNextIDSize]byte {
 	return id
 }
 
-func (s *Service) acceptLoop() {
+func (s *Service) acceptLoop(listener net.Listener) {
 	defer s.wg.Done()
 	for {
-		conn, err := s.listener.Accept()
+		conn, err := listener.Accept()
 		if err != nil {
 			select {
 			case <-s.stop:
@@ -145,12 +191,27 @@ func (s *Service) acceptLoop() {
 			s.log("tkmnet relay accept failed", "error", err)
 			continue
 		}
+		s.mu.Lock()
+		if s.stopped {
+			s.mu.Unlock()
+			_ = conn.Close()
+			return
+		}
+		s.conns[conn] = struct{}{}
 		s.wg.Add(1)
+		s.mu.Unlock()
 		go func() {
 			defer s.wg.Done()
+			defer s.removeConn(conn)
 			s.handleConn(conn)
 		}()
 	}
+}
+
+func (s *Service) removeConn(conn net.Conn) {
+	s.mu.Lock()
+	delete(s.conns, conn)
+	s.mu.Unlock()
 }
 
 func (s *Service) handleConn(conn net.Conn) {
@@ -174,7 +235,13 @@ func (s *Service) handleConn(conn net.Conn) {
 	if s.cfg.Handler == nil {
 		return
 	}
-	response, err := s.cfg.Handler(context.Background(), route, packet)
+	s.mu.RLock()
+	ctx := s.ctx
+	s.mu.RUnlock()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	response, err := s.cfg.Handler(ctx, route, packet)
 	if err != nil || len(response) == 0 {
 		return
 	}

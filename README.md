@@ -21,7 +21,14 @@ ledger privacy; tkmnet protects transport origin and service payloads.
 
 ## Integration boundary
 
-The next integration step is a `node.Lifecycle` service under `gtkm`. It will
-listen only on the local side of a Tor onion service, use a separate
-`~/.tkmchain/tkmnet` state directory, and expose no clearnet listener. The
-transport remains optional until relay interoperability tests pass.
+The package implements `node.Lifecycle` and is registered by `gtkm` when
+`--tkmnet.enable` is set. It listens only on the local side of a Tor onion
+service, uses a separate `~/.tkmchain/tkmnet` state directory, and exposes no
+clearnet listener. The node owns startup and shutdown ordering: stopping the
+node cancels the relay context, closes active connections, and waits for all
+relay goroutines to exit.
+
+The package is published at
+[`github.com/tkmchain/tkmnet`](https://github.com/tkmchain/tkmnet). TKMChain
+currently compiles the matching copy in its main module so the transport and
+consensus code are released together.

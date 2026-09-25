@@ -3,6 +3,7 @@ package tkmnet
 import (
 	"bytes"
 	"crypto/mlkem"
+	"net"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -163,6 +164,51 @@ func TestServiceLifecycleAndPersistentRelayKey(t *testing.T) {
 	if svc2.RelayID() != id {
 		t.Fatal("relay identity changed after restart")
 	}
+}
+
+func TestServiceLifecycleStateAndShutdown(t *testing.T) {
+	keyPath := filepath.Join(t.TempDir(), "relay", "key")
+	svc, err := NewService(ServiceConfig{
+		Enabled:        true,
+		ListenAddr:     "127.0.0.1:0",
+		PrivateKeyPath: keyPath,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Stop(); err != nil {
+		t.Fatalf("stop before start: %v", err)
+	}
+	if err := svc.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Start(); err != ErrServiceStarted {
+		t.Fatalf("duplicate start error = %v, want %v", err, ErrServiceStarted)
+	}
+	conn, err := net.DialTimeout("tcp", svc.Addr().String(), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Stop(); err != nil {
+		t.Fatalf("duplicate stop: %v", err)
+	}
+	if svc.Addr() != nil {
+		t.Fatal("stopped service still exposes a listener")
+	}
+	if err := svc.Start(); err != ErrServiceStopped {
+		t.Fatalf("restart error = %v, want %v", err, ErrServiceStopped)
+	}
+	if err := conn.SetDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var one [1]byte
+	if _, err := conn.Read(one[:]); err == nil {
+		t.Fatal("connection remained open after service shutdown")
+	}
+	_ = conn.Close()
 }
 
 func TestTransferChunking(t *testing.T) {
