@@ -44,8 +44,8 @@ type ServiceConfig struct {
 // A non-empty returned packet is written back on the same connection.
 type Handler func(context.Context, Route, []byte) ([]byte, error)
 
-// Service implements node.Lifecycle without importing the node package. It
-// can therefore be registered directly with gtkm's protocol stack.
+// Service implements node.Lifecycle and can be registered directly with
+// gtkm's protocol stack.
 type Service struct {
 	cfg      ServiceConfig
 	mu       sync.RWMutex
